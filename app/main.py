@@ -5,15 +5,18 @@
 # The relationship is: uvicorn → starlette (ASGI) → FastAPI (routing + validation).
 
 import json
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 
-from app.database import create_task, get_task, init_db, update_task_status
+from app.database import create_task, get_task, init_db, save_task_result, update_task_status
 from app.models import TaskResult, TaskStatus
+from app.processor import process_video
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +82,82 @@ app = FastAPI(
 
 
 # ---------------------------------------------------------------------------
+# Background pipeline job
+# ---------------------------------------------------------------------------
+
+def _run_pipeline(task_id: str, video_path: str) -> None:
+    """Run the full analysis pipeline and persist the result.
+
+    This function is invoked by FastAPI's BackgroundTasks mechanism after the
+    POST /tasks HTTP response has already been sent to the client. The client
+    gets an immediate 201 with a task_id and then polls GET /tasks/{task_id}
+    until this function finishes and sets status to 'complete' or 'failed'.
+
+    Why background processing instead of blocking the POST handler?
+
+    Video analysis is slow — YOLO inference on a 60-second 1080p clip takes
+    30–120 seconds depending on hardware. Blocking the HTTP request for that
+    long would:
+      - Time out most HTTP clients (default timeout is 30 s)
+      - Tie up a thread-pool thread for the entire duration, reducing
+        the server's ability to handle concurrent requests
+      - Give the client no progress visibility
+
+    The async task-id / polling pattern solves all three: the API returns in
+    milliseconds, the client can show a progress indicator, and the server
+    remains responsive for other requests while the pipeline runs in the
+    background.
+
+    Production upgrade: replace BackgroundTasks with Celery + Redis so that
+    tasks survive server restarts, can be distributed across multiple workers,
+    and can be queued without blocking any server thread at all.
+
+    Why synchronous (def) rather than async (async def)?
+
+    All pipeline operations — YOLO inference, OpenCV decoding, SQLite writes —
+    are blocking I/O and CPU work. There is no benefit to making this async
+    because we have nothing to await; every call needs the CPU until it returns.
+    FastAPI's BackgroundTasks runs sync functions in the same thread-pool it uses
+    for sync route handlers, which is the correct execution model here.
+
+    Thread safety:
+    Each call to _run_pipeline uses short-lived DB connections (see database.py),
+    so multiple concurrent tasks running on different threads never share a
+    connection. The Detector creates its own YOLO instance per call (see
+    processor.py) so YOLO's ByteTrack internal state is never shared.
+    """
+    logger.info("[%s] Background pipeline starting.", task_id)
+
+    try:
+        # Immediately flip status so polling clients see "processing" rather
+        # than "queued" while the video is being analysed.
+        # If the server crashes between this line and save_task_result(), the
+        # task will be stuck in "processing" on restart. A production system
+        # would have a watchdog that re-queues stalled tasks — out of scope here.
+        update_task_status(task_id, "processing")
+
+        result_dict = process_video(task_id=task_id, video_path=video_path)
+
+        # save_task_result writes result_json and atomically sets status="complete"
+        # in the same UPDATE statement (see database.py), so there is no window
+        # where status is "complete" but result_json is still NULL.
+        save_task_result(task_id=task_id, result=result_dict)
+
+        logger.info("[%s] Pipeline complete, result persisted.", task_id)
+
+    except Exception as exc:
+        # Catch everything: a corrupt video file, an unsupported codec, a YOLO
+        # assertion error, or any bug in the pipeline. Setting status="failed"
+        # with a readable error message means:
+        #   - The server keeps running (the exception doesn't propagate up)
+        #   - GET /tasks/{task_id} returns a useful error string to the client
+        #   - We can diagnose the issue from the tasks.db error column
+        error_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("[%s] Pipeline failed: %s", task_id, error_msg)
+        update_task_status(task_id, "failed", error=error_msg)
+
+
+# ---------------------------------------------------------------------------
 # POST /tasks — upload a video and enqueue analysis
 # ---------------------------------------------------------------------------
 
@@ -91,16 +170,19 @@ app = FastAPI(
     status_code=201,
 )
 def create_analysis_task(
-    # UploadFile wraps the multipart file from the client. FastAPI reads the
-    # Content-Type boundary automatically when `python-multipart` is installed
-    # (it's in requirements.txt). The File(...) call marks the field as required.
+    # BackgroundTasks is a FastAPI special type — it is injected automatically
+    # by the dependency system, not read from the request body. Listing it as
+    # a parameter is sufficient; no decorator needed.
+    background_tasks: BackgroundTasks,
+    # UploadFile wraps the multipart file. FastAPI parses the Content-Type
+    # boundary automatically when python-multipart is installed.
     file: UploadFile = File(..., description="Video file to analyse (e.g. MP4, AVI)"),
 ):
-    """Accept an uploaded video, save it to disk, and create a queued task record.
+    """Accept an uploaded video, persist it, enqueue background analysis, and return immediately.
 
-    The actual video processing pipeline is not yet implemented. This endpoint
-    just persists the file and returns a task_id. Clients should then poll
-    GET /tasks/{task_id} until the status reaches 'complete' or 'failed'.
+    The pipeline runs asynchronously — this handler returns in milliseconds.
+    Clients should poll GET /tasks/{task_id} until status is 'complete' or 'failed',
+    then fetch the full result from GET /tasks/{task_id}/result.
     """
 
     # --- 1. Generate a globally unique task ID ---
@@ -120,7 +202,7 @@ def create_analysis_task(
         # large files are automatically spooled to a temp file. We read in 1 MB
         # chunks to avoid loading the entire video into memory at once.
         with open(video_path, "wb") as dest:
-            while chunk := file.file.read(1024 * 1024):  # walrus operator: assign + test
+            while chunk := file.file.read(1024 * 1024):  # walrus: assign + test
                 dest.write(chunk)
     except Exception as exc:
         # Surface upload errors as 500 so the client knows the task was NOT created.
@@ -130,14 +212,17 @@ def create_analysis_task(
         )
 
     # --- 4. Create the task record in SQLite ---
-    # This must happen AFTER the file is safely on disk; we don't want a task row
-    # pointing to a file that doesn't exist.
+    # Must happen AFTER the file is safely on disk; we don't want a DB row
+    # pointing to a file path that doesn't exist yet.
     create_task(task_id=task_id, video_path=str(video_path))
 
-    # --- 5. Return the task_id ---
-    # In a production service you would also kick off background processing here,
-    # e.g. enqueue a Celery task or use FastAPI's built-in BackgroundTasks.
-    # For now the task stays 'queued' until the processor is implemented.
+    # --- 5. Enqueue the background pipeline job ---
+    # add_task registers _run_pipeline to be called after this HTTP response
+    # is fully sent. The arguments are passed through as positional args.
+    background_tasks.add_task(_run_pipeline, task_id, str(video_path))
+
+    logger.info("[%s] Task created, pipeline queued. file=%s", task_id, file.filename)
+
     return {"task_id": task_id, "status": "queued"}
 
 
