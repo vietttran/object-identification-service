@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific
+*.mp4
+*.pt
+data/uploads/
+data/outputs/
+*.db
