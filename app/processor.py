@@ -15,20 +15,29 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 import logging
+from pathlib import Path
 from typing import Any, Dict, List
 
 from app.models import (
     DetectedObject,
     Interaction,
+    KeyFrame,
     MotionInterval,
     TaskResult,
     VideoMetadata,
 )
 from app.pipeline.detection import Detector
 from app.pipeline.interaction import detect_interactions
+from app.pipeline.keyframes import extract_keyframes
 from app.pipeline.motion import classify_motion
 
 logger = logging.getLogger(__name__)
+
+# Resolve the outputs directory once at import time. JPEGs extracted by the
+# keyframe stage are written into a per-task subdirectory under this root.
+# Pattern: data/outputs/{task_id}/obj{id}_frame{n:06d}_{reason}.jpg
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_OUTPUTS_DIR  = _PROJECT_ROOT / "data" / "outputs"
 
 
 def process_video(
@@ -227,7 +236,47 @@ def process_video(
             )
         )
 
-    # ── Stage 6: Build and validate the top-level result ─────────────────────
+    # ── Stage 6: Keyframe extraction (bonus feature — non-fatal) ─────────────
+    #
+    # Why is this wrapped in a try/except when the other stages are not?
+    #
+    # Keyframe extraction is an enhancement, not a core deliverable. The motion
+    # history and interaction data computed above are the API contract; the JPEG
+    # stills are supporting evidence for human review. If extraction fails — due
+    # to a corrupt video segment, a full disk, an OpenCV codec edge case, or any
+    # bug in the keyframe logic — that failure must not set the task to "failed"
+    # and discard the correctly-computed pipeline results. The catch here converts
+    # a fatal crash into a logged warning: the caller gets a complete TaskResult
+    # with an empty keyFrames list rather than no result at all.
+    #
+    # General principle: non-essential features should degrade gracefully so they
+    # can never jeopardise the output that the core pipeline has already earned.
+
+    keyframe_models: List[KeyFrame] = []
+    try:
+        task_output_dir = _OUTPUTS_DIR / task_id
+        task_output_dir.mkdir(parents=True, exist_ok=True)
+
+        raw_keyframes = extract_keyframes(
+            video_path=video_path,
+            objects_detected=detected_objects,
+            interactions_by_object=interactions_by_object,
+            output_dir=task_output_dir,
+            task_id=task_id,
+            fps=metadata_dict.get("fps", 0.0),
+        )
+        keyframe_models = [KeyFrame(**kf) for kf in raw_keyframes]
+        logger.info("[%s] Keyframe extraction: %d still(s) saved to %s",
+                    task_id, len(keyframe_models), task_output_dir)
+
+    except Exception as exc:
+        logger.warning(
+            "[%s] Keyframe extraction failed (non-fatal, continuing without stills): %s",
+            task_id, exc,
+        )
+        keyframe_models = []
+
+    # ── Stage 7: Build and validate the top-level result ─────────────────────
     #
     # Constructing the Pydantic model here (rather than just building a raw dict)
     # provides schema validation at write time: if any field is wrong type or missing,
@@ -238,9 +287,7 @@ def process_video(
     result = TaskResult(
         videoMetadata=VideoMetadata(**metadata_dict),
         objectsDetected=detected_objects,
-        # Keyframe extraction is not yet implemented. null serialises as JSON null,
-        # which is more honest than omitting the field entirely.
-        keyFrames=None,
+        keyFrames=keyframe_models if keyframe_models else None,
     )
 
     logger.info(
